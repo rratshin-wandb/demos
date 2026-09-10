@@ -1,44 +1,6 @@
-"""
-helpdesk_env.py
-
-Self-contained mock IT helpdesk environment for the Serverless RL demo.
-
-Everything the agent can do lives behind a small set of "tool" functions
-(HelpdeskTools below): get_escalation_policy, lookup_account,
-check_ticket_history, search_kb, resolve_ticket, create_escalation.
-
-Ground truth for each generated ticket is deterministic and NOT something a
-generic instruction-tuned model can guess: several categories require
-combining two different tool results (e.g. account tier + ticket history)
-against an arbitrary, company-specific policy. That's what makes this a good
-RL demo - a capable base model still won't reliably get these right, and the
-policy is simple/stable enough to be learnable in a short training run.
-
-score_trajectory() grades a finished episode against that hidden ground
-truth, and is deterministic/rule-based on purpose: no LLM judge involved, so
-the before/after numbers in the demo are fully auditable.
-
-W&B Weave instrumentation:
-  - Every tool call and score_trajectory() are @weave.op(), so a Weave trace
-    shows exactly which tools an episode called, with what arguments, and how
-    it was graded.
-  - ticket_to_row()/build_weave_dataset() flatten tickets (+ their hidden
-    account/history fields) into self-contained dicts suitable for
-    weave.Evaluation(dataset=...) - see agent.py's HelpdeskAgentModel and this
-    file's PolicyComplianceScorer for the other half.
-  - world_and_ticket_from_row() is the inverse: it rebuilds a single-ticket
-    World from one of those rows, so predict()/score() never need to share a
-    mutable World object - each row is fully self-describing, which is the
-    idiomatic Weave dataset pattern.
-
-This module requires `weave` to be installed (`pip install weave`).
-"""
-
 import random
 from dataclasses import dataclass
 from typing import Optional
-
-import weave
 
 # ---------------------------------------------------------------------------
 # Static reference data
@@ -57,7 +19,22 @@ CATEGORIES = [
     "hardware_failure",
     "software_license",
     "slow_performance",
+    "access_request",
 ]
+
+# "access_request" tickets are deliberately engineered to be ambiguous: the
+# ticket text NEVER says which resource the requester means (see
+# TICKET_TEMPLATES below) - that detail only exists as Ticket.hidden_detail,
+# which is invisible to the agent until it asks (request_more_info) and the
+# requester answers. This is the one category where clarifying is the
+# objectively correct first move - every other category is fully decidable
+# from lookup_account/check_ticket_history/search_kb alone, so asking there
+# is an unnecessary-clarification miss (see score_trajectory below).
+RESOURCE_POOL = [
+    "team-drive", "project-wiki", "shared-calendar", "onboarding-docs",
+    "finance-reports", "hr-personnel-files", "payroll-records", "exec-board-docs",
+]
+RESTRICTED_RESOURCES = {"finance-reports", "hr-personnel-files", "payroll-records", "exec-board-docs"}
 
 KB_ARTICLES = {
     "password_reset": ("KB-101", "Self-service password reset: visit reset.corp.internal, verify with MFA, set a new password."),
@@ -97,9 +74,18 @@ IT HELPDESK ESCALATION POLICY (v3)
    account has 2 or more performance tickets in the last 30 days, which may
    indicate degrading hardware - escalate to Hardware at P3.
 
+7. Access requests: the ticket alone never says which specific resource
+   (drive, folder, or system) the requester needs access to - always ask
+   them to name it (request_more_info) before doing anything else. Once
+   they've named it, resources on the restricted list (financial, HR/
+   personnel, payroll, or executive/board records) must be escalated to
+   SecOps at P2; anything else can be granted directly.
+
 Always check the account record and ticket history before deciding. Ticket
 tone/urgency language is not a reliable signal of true priority - follow this
-policy, not the wording.
+policy, not the wording. Only use request_more_info for details that can
+ONLY come from the requester - never as a substitute for calling
+lookup_account, check_ticket_history, or search_kb.
 """
 
 TICKET_TEMPLATES = {
@@ -139,6 +125,13 @@ TICKET_TEMPLATES = {
         "My computer has been really slow the last few days.",
         "Everything takes forever to load on my laptop lately.",
     ],
+    # Deliberately never names the resource - that's Ticket.hidden_detail,
+    # revealed only once the agent asks (request_more_info) and the
+    # requester replies. See RESOURCE_POOL/RESTRICTED_RESOURCES above.
+    "access_request": [
+        "Can you set me up with access to a shared drive? I need it for a project.",
+        "I need access to a folder I don't currently have permissions for.",
+    ],
 }
 
 
@@ -148,6 +141,12 @@ class Ticket:
     account_id: str
     category: str
     text: str
+    # Hidden detail an "access_request" ticket is missing - the true
+    # resource name, invisible to the agent (and absent from `text` above)
+    # until it calls request_more_info and the requester answers. None for
+    # every other category - those are fully decidable from the tools
+    # alone, no clarification needed.
+    hidden_detail: Optional[str] = None
 
 
 @dataclass
@@ -194,8 +193,13 @@ def generate_world_and_tickets(n: int, seed: int, id_prefix: str = "EV"):
             repeat_count = 1
         history[(account_id, category)] = repeat_count
 
+        # The one piece of ground truth that ISN'T discoverable via any tool
+        # - see Ticket.hidden_detail's docstring.
+        hidden_detail = rng.choice(RESOURCE_POOL) if category == "access_request" else None
+
         text = rng.choice(TICKET_TEMPLATES[category])
-        tickets.append(Ticket(ticket_id=f"{id_prefix}-T{i:05d}", account_id=account_id, category=category, text=text))
+        tickets.append(Ticket(ticket_id=f"{id_prefix}-T{i:05d}", account_id=account_id, category=category, text=text,
+                               hidden_detail=hidden_detail))
 
     return World(accounts=accounts, history=history), tickets
 
@@ -209,12 +213,10 @@ class HelpdeskTools:
         self.world = world
         self.calls = []  # audit log of (tool_name, args_or_action) this episode
 
-    @weave.op()
     def get_escalation_policy(self):
         self.calls.append(("get_escalation_policy", {}))
         return POLICY_TEXT
 
-    @weave.op()
     def lookup_account(self, account_id: str):
         self.calls.append(("lookup_account", {"account_id": account_id}))
         acc = self.world.accounts.get(account_id)
@@ -222,12 +224,10 @@ class HelpdeskTools:
             return {"error": "unknown account"}
         return {"tier": acc.tier, "device_os": acc.device_os, "seats_remaining": acc.seats_remaining}
 
-    @weave.op()
     def check_ticket_history(self, account_id: str, category: str):
         self.calls.append(("check_ticket_history", {"account_id": account_id, "category": category}))
         return {"tickets_last_30_days": self.world.history.get((account_id, category), 0)}
 
-    @weave.op()
     def search_kb(self, query: str):
         self.calls.append(("search_kb", {"query": query}))
         q = query.lower()
@@ -240,13 +240,21 @@ class HelpdeskTools:
             matches = [{"kb_id": kb_id, "category": cat, "body": body} for cat, (kb_id, body) in KB_ARTICLES.items()]
         return matches[:3]
 
-    @weave.op()
+    def request_more_info(self, question: str):
+        """Non-terminal: ends the current turn without resolving/escalating,
+        and waits for the requester to reply. Not in TERMINAL_TOOLS (agent
+        module) - it's the one other tool that ends a turn, but with a
+        "pending clarification" outcome rather than a final action. See the
+        agent module's PENDING_TOOLS / run_episode()."""
+        action = {"type": "request_more_info", "question": question}
+        self.calls.append(("request_more_info", action))
+        return {"status": "pending_customer_reply"}
+
     def resolve_ticket(self, kb_article_id: str, response_text: str):
         action = {"type": "resolve", "kb_article_id": kb_article_id, "response_text": response_text}
         self.calls.append(("resolve_ticket", action))
         return {"status": "resolved"}
 
-    @weave.op()
     def create_escalation(self, team: str, priority: str, notes: str):
         action = {"type": "escalate", "team": team, "priority": priority, "notes": notes}
         self.calls.append(("create_escalation", action))
@@ -260,6 +268,12 @@ class HelpdeskTools:
 def ground_truth(account_id: str, category: str, world: World):
     acc = world.accounts[account_id]
     repeat = world.history.get((account_id, category), 0)
+
+    if category == "access_request":
+        # The correct FIRST move is always to ask - the resource name isn't
+        # discoverable from any tool. See ground_truth_for_resource() for
+        # what's correct once the requester has answered.
+        return {"action": "clarify", "requires": []}
 
     if category in ("phishing_report", "malware_alert"):
         priority = "P0" if (acc.tier == "executive" or repeat >= 1) else "P1"
@@ -292,22 +306,79 @@ def ground_truth(account_id: str, category: str, world: World):
     raise ValueError(f"unhandled category {category}")
 
 
-@weave.op()
+def ground_truth_for_resource(resource: Optional[str]) -> dict:
+    """Ground truth for an "access_request" ticket once the requester has
+    named the resource - only knowable after request_more_info's reply (see
+    Ticket.hidden_detail). Mirrors ground_truth()'s {"action", ...} shape so
+    score_trajectory can reuse the same resolve/escalate comparison logic."""
+    if resource in RESTRICTED_RESOURCES:
+        return {"action": "escalate", "team": "SecOps", "priority": "P2", "requires": []}
+    return {"action": "resolve", "kb_id": None, "requires": []}
+
+
 def score_trajectory(ticket: Ticket, world: World, tool_calls: list, final_action: Optional[dict]):
     """
     tool_calls: HelpdeskTools.calls for this episode - list of (name, args) tuples.
+                For a resumed (multi-round) episode, this should be the FULL
+                history across both rounds (see the agent module's
+                prior_tool_calls), so "did it ask" reflects the whole
+                trajectory, not just the most recent round.
     final_action: the dict passed to resolve_ticket / create_escalation, or None
-                  if the episode ended without a terminal action.
+                  if the episode ended without a terminal action (including
+                  "still pending a clarification reply").
     Returns (score in [0, 1], breakdown dict) - used both as the printed eval
     metric and directly as the RL reward.
+
+    Two ways this can go wrong that are specific to the clarification
+    mechanism, on top of the existing action/team/priority/kb checks:
+      - false negative: an "access_request" ticket resolved/escalated
+        without ever calling request_more_info first (score 0 - the ticket
+        genuinely can't be decided correctly without asking).
+      - false positive: any OTHER category where request_more_info was
+        called even though every fact needed was already available via
+        lookup_account/check_ticket_history/search_kb (scored, but
+        penalized - see "unnecessary_clarification" below).
     """
-    truth = ground_truth(ticket.account_id, ticket.category, world)
     called_names = {name for name, _ in tool_calls}
+    asked_for_clarification = "request_more_info" in called_names
+
+    if ticket.category == "access_request":
+        breakdown = {"asked_for_clarification": asked_for_clarification}
+        if not asked_for_clarification:
+            breakdown["action_type_ok"] = False
+            breakdown["required_tools_called"] = False
+            breakdown["reason"] = "did_not_ask_when_needed"
+            return 0.0, breakdown
+        if final_action is None:
+            breakdown["action_type_ok"] = False
+            breakdown["required_tools_called"] = True
+            breakdown["reason"] = "asked_but_no_final_action"
+            return 0.2, breakdown
+
+        resolved_truth = ground_truth_for_resource(ticket.hidden_detail)
+        action_type_ok = final_action["type"] == resolved_truth["action"]
+        breakdown["action_type_ok"] = action_type_ok
+        breakdown["required_tools_called"] = True
+
+        score = 0.4  # asked when it should have - the hard part of this category
+        score += 0.3 if action_type_ok else 0.0
+        if resolved_truth["action"] == "escalate" and final_action["type"] == "escalate":
+            team_ok = final_action.get("team") == resolved_truth["team"]
+            priority_ok = final_action.get("priority") == resolved_truth["priority"]
+            breakdown["team_ok"], breakdown["priority_ok"] = team_ok, priority_ok
+            score += 0.15 if team_ok else 0.0
+            score += 0.15 if priority_ok else 0.0
+        elif resolved_truth["action"] == "resolve" and final_action["type"] == "resolve":
+            score += 0.3
+        return round(min(score, 1.0), 3), breakdown
+
+    truth = ground_truth(ticket.account_id, ticket.category, world)
 
     if final_action is None:
-        return 0.0, {"reason": "no_final_action", "required_tools_called": False, "action_type_ok": False}
+        return 0.0, {"reason": "no_final_action", "required_tools_called": False, "action_type_ok": False,
+                      "asked_for_clarification": asked_for_clarification}
 
-    breakdown = {}
+    breakdown = {"asked_for_clarification": asked_for_clarification}
     required_ok = all(req in called_names for req in truth["requires"])
     breakdown["required_tools_called"] = required_ok
 
@@ -331,20 +402,25 @@ def score_trajectory(ticket: Ticket, world: World, tool_calls: list, final_actio
     else:
         breakdown["team_ok"] = breakdown["priority_ok"] = breakdown["kb_ok"] = False
 
+    # Every fact needed for this category is available via the tools alone -
+    # asking here isn't wrong in the sense of getting the ticket wrong, but
+    # it's an unnecessary round-trip the policy doesn't call for, so it's
+    # penalized rather than scored as a miss.
+    breakdown["unnecessary_clarification"] = asked_for_clarification
+    if asked_for_clarification:
+        score *= 0.7
+
     return round(min(score, 1.0), 3), breakdown
 
 
 # ---------------------------------------------------------------------------
-# Weave dataset <-> World/Ticket conversion
+# Dataset <-> World/Ticket conversion
 #
-# A weave.Evaluation dataset should be a list of self-contained dicts (see
-# weave-docs.wandb.ai/guides/core-types/evaluations). Rather than pass a
-# shared, mutable World object around, we flatten each ticket plus its hidden
-# account/history fields into one row, and rebuild a single-account World
-# from that row wherever it's needed (agent.py's HelpdeskAgentModel.predict,
-# and PolicyComplianceScorer.score below). This keeps every row fully
-# self-describing - you can look at one row in the Weave UI and see exactly
-# what determined the correct answer.
+# Flatten each ticket plus its hidden account/history fields into one row,
+# and rebuild a single-account World from that row wherever it's needed
+# (the agent module's HelpdeskAgentModel.predict, and
+# PolicyComplianceScorer.score below). This keeps every row fully
+# self-describing.
 # ---------------------------------------------------------------------------
 
 def ticket_to_row(ticket: Ticket, world: World) -> dict:
@@ -358,12 +434,14 @@ def ticket_to_row(ticket: Ticket, world: World) -> dict:
         "account_device_os": acc.device_os,
         "account_seats_remaining": acc.seats_remaining,
         "history_count_30d": world.history.get((ticket.account_id, ticket.category), 0),
+        "hidden_detail": ticket.hidden_detail,
     }
 
 
 def build_weave_dataset(world: World, tickets: list) -> list:
-    """The dataset= argument for weave.Evaluation - one self-contained row
-    per ticket."""
+    """One self-contained row per ticket (name kept for drop-in
+    compatibility with the Weave-instrumented module - there's nothing
+    Weave-specific about the shape itself)."""
     return [ticket_to_row(t, world) for t in tickets]
 
 
@@ -383,27 +461,25 @@ def world_and_ticket_from_row(row: dict):
     ticket = Ticket(
         ticket_id=row["ticket_id"], account_id=row["account_id"],
         category=row["category"], text=row["text"],
+        hidden_detail=row.get("hidden_detail"),
     )
     return world, ticket
 
 
-class PolicyComplianceScorer(weave.Scorer):
-    """weave.Evaluation scorer: grades one predict() output against the
-    ticket's hidden ground truth. Deterministic and rule-based on purpose -
-    no LLM judge involved, so the before/after numbers this produces in Weave
-    are fully auditable. Numeric/boolean fields returned here are averaged
-    automatically by Weave's auto_summarize (means for numbers, counts/
-    fractions for booleans), which is what populates the Evals comparison
-    view in the UI."""
+class PolicyComplianceScorer:
+    """Grades one predict() output against the ticket's hidden ground truth.
+    Deterministic and rule-based on purpose - no LLM judge involved, so the
+    before/after numbers this produces are fully auditable. - call .score(...) directly."""
 
-    @weave.op()
     def score(self, output: dict, ticket_id: str, account_id: str, category: str,
               text: str, account_tier: str, account_device_os: str,
-              account_seats_remaining: int, history_count_30d: int) -> dict:
+              account_seats_remaining: int, history_count_30d: int,
+              hidden_detail: Optional[str] = None) -> dict:
         world, ticket = world_and_ticket_from_row({
             "ticket_id": ticket_id, "account_id": account_id, "category": category, "text": text,
             "account_tier": account_tier, "account_device_os": account_device_os,
             "account_seats_remaining": account_seats_remaining, "history_count_30d": history_count_30d,
+            "hidden_detail": hidden_detail,
         })
         tool_calls = [(tc["name"], tc["args"]) for tc in output.get("tool_calls", [])]
         score, breakdown = score_trajectory(ticket, world, tool_calls, output.get("final_action"))
@@ -413,8 +489,9 @@ class PolicyComplianceScorer(weave.Scorer):
             "fully_correct": score >= 0.999,
             "action_type_ok": breakdown.get("action_type_ok", False),
             "required_tools_called": breakdown.get("required_tools_called", False),
+            "asked_for_clarification": breakdown.get("asked_for_clarification", False),
         }
-        for key in ("team_ok", "priority_ok", "kb_ok"):
+        for key in ("team_ok", "priority_ok", "kb_ok", "unnecessary_clarification"):
             if key in breakdown:
                 result[key] = breakdown[key]
 
