@@ -28,7 +28,7 @@ except ImportError:
         world_and_ticket_from_row, PolicyComplianceScorer,
     )
 
-DEFAULT_BASE_URL = "https://api.training.wandb.ai/v1"  # W&B Serverless Training's OpenAI-compatible endpoint
+DEFAULT_BASE_URL = "https://api.openai.com/v1"
 
 SYSTEM_PROMPT = """You are an IT helpdesk triage agent. For each ticket you must:
 1. Gather the facts you need using the available tools (account info, ticket
