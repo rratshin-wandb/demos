@@ -1,6 +1,44 @@
+"""
+helpdesk_env.py
+
+Self-contained mock IT helpdesk environment for the Serverless RL demo.
+
+Everything the agent can do lives behind a small set of "tool" functions
+(HelpdeskTools below): get_escalation_policy, lookup_account,
+check_ticket_history, search_kb, resolve_ticket, create_escalation.
+
+Ground truth for each generated ticket is deterministic and NOT something a
+generic instruction-tuned model can guess: several categories require
+combining two different tool results (e.g. account tier + ticket history)
+against an arbitrary, company-specific policy. That's what makes this a good
+RL demo - a capable base model still won't reliably get these right, and the
+policy is simple/stable enough to be learnable in a short training run.
+
+score_trajectory() grades a finished episode against that hidden ground
+truth, and is deterministic/rule-based on purpose: no LLM judge involved, so
+the before/after numbers in the demo are fully auditable.
+
+W&B Weave instrumentation:
+  - Every tool call and score_trajectory() are @weave.op(), so a Weave trace
+    shows exactly which tools an episode called, with what arguments, and how
+    it was graded.
+  - ticket_to_row()/build_weave_dataset() flatten tickets (+ their hidden
+    account/history fields) into self-contained dicts suitable for
+    weave.Evaluation(dataset=...) - see agent.py's HelpdeskAgentModel and this
+    file's PolicyComplianceScorer for the other half.
+  - world_and_ticket_from_row() is the inverse: it rebuilds a single-ticket
+    World from one of those rows, so predict()/score() never need to share a
+    mutable World object - each row is fully self-describing, which is the
+    idiomatic Weave dataset pattern.
+
+This module requires `weave` to be installed (`pip install weave`).
+"""
+
 import random
 from dataclasses import dataclass
 from typing import Optional
+
+import weave
 
 # ---------------------------------------------------------------------------
 # Static reference data
@@ -213,10 +251,12 @@ class HelpdeskTools:
         self.world = world
         self.calls = []  # audit log of (tool_name, args_or_action) this episode
 
+    @weave.op()
     def get_escalation_policy(self):
         self.calls.append(("get_escalation_policy", {}))
         return POLICY_TEXT
 
+    @weave.op()
     def lookup_account(self, account_id: str):
         self.calls.append(("lookup_account", {"account_id": account_id}))
         acc = self.world.accounts.get(account_id)
@@ -224,10 +264,12 @@ class HelpdeskTools:
             return {"error": "unknown account"}
         return {"tier": acc.tier, "device_os": acc.device_os, "seats_remaining": acc.seats_remaining}
 
+    @weave.op()
     def check_ticket_history(self, account_id: str, category: str):
         self.calls.append(("check_ticket_history", {"account_id": account_id, "category": category}))
         return {"tickets_last_30_days": self.world.history.get((account_id, category), 0)}
 
+    @weave.op()
     def search_kb(self, query: str):
         self.calls.append(("search_kb", {"query": query}))
         q = query.lower()
@@ -240,21 +282,24 @@ class HelpdeskTools:
             matches = [{"kb_id": kb_id, "category": cat, "body": body} for cat, (kb_id, body) in KB_ARTICLES.items()]
         return matches[:3]
 
+    @weave.op()
     def request_more_info(self, question: str):
         """Non-terminal: ends the current turn without resolving/escalating,
-        and waits for the requester to reply. Not in TERMINAL_TOOLS (agent
-        module) - it's the one other tool that ends a turn, but with a
-        "pending clarification" outcome rather than a final action. See the
-        agent module's PENDING_TOOLS / run_episode()."""
+        and waits for the requester to reply. Not in TERMINAL_TOOLS (agent.py)
+        - it's the one other tool that ends a turn, but with a
+        "pending clarification" outcome rather than a final action. See
+        agent.py's PENDING_TOOLS / run_episode()."""
         action = {"type": "request_more_info", "question": question}
         self.calls.append(("request_more_info", action))
         return {"status": "pending_customer_reply"}
 
+    @weave.op()
     def resolve_ticket(self, kb_article_id: str, response_text: str):
         action = {"type": "resolve", "kb_article_id": kb_article_id, "response_text": response_text}
         self.calls.append(("resolve_ticket", action))
         return {"status": "resolved"}
 
+    @weave.op()
     def create_escalation(self, team: str, priority: str, notes: str):
         action = {"type": "escalate", "team": team, "priority": priority, "notes": notes}
         self.calls.append(("create_escalation", action))
@@ -316,13 +361,14 @@ def ground_truth_for_resource(resource: Optional[str]) -> dict:
     return {"action": "resolve", "kb_id": None, "requires": []}
 
 
+@weave.op()
 def score_trajectory(ticket: Ticket, world: World, tool_calls: list, final_action: Optional[dict]):
     """
     tool_calls: HelpdeskTools.calls for this episode - list of (name, args) tuples.
                 For a resumed (multi-round) episode, this should be the FULL
-                history across both rounds (see the agent module's
-                prior_tool_calls), so "did it ask" reflects the whole
-                trajectory, not just the most recent round.
+                history across both rounds (see agent.py's prior_tool_calls),
+                so "did it ask" reflects the whole trajectory, not just the
+                most recent round.
     final_action: the dict passed to resolve_ticket / create_escalation, or None
                   if the episode ended without a terminal action (including
                   "still pending a clarification reply").
@@ -414,13 +460,16 @@ def score_trajectory(ticket: Ticket, world: World, tool_calls: list, final_actio
 
 
 # ---------------------------------------------------------------------------
-# Dataset <-> World/Ticket conversion
+# Weave dataset <-> World/Ticket conversion
 #
-# Flatten each ticket plus its hidden account/history fields into one row,
-# and rebuild a single-account World from that row wherever it's needed
-# (the agent module's HelpdeskAgentModel.predict, and
-# PolicyComplianceScorer.score below). This keeps every row fully
-# self-describing.
+# A weave.Evaluation dataset should be a list of self-contained dicts (see
+# weave-docs.wandb.ai/guides/core-types/evaluations). Rather than pass a
+# shared, mutable World object around, we flatten each ticket plus its hidden
+# account/history fields into one row, and rebuild a single-account World
+# from that row wherever it's needed (agent.py's HelpdeskAgentModel.predict,
+# and PolicyComplianceScorer.score below). This keeps every row fully
+# self-describing - you can look at one row in the Weave UI and see exactly
+# what determined the correct answer.
 # ---------------------------------------------------------------------------
 
 def ticket_to_row(ticket: Ticket, world: World) -> dict:
@@ -439,9 +488,8 @@ def ticket_to_row(ticket: Ticket, world: World) -> dict:
 
 
 def build_weave_dataset(world: World, tickets: list) -> list:
-    """One self-contained row per ticket (name kept for drop-in
-    compatibility with the Weave-instrumented module - there's nothing
-    Weave-specific about the shape itself)."""
+    """The dataset= argument for weave.Evaluation - one self-contained row
+    per ticket."""
     return [ticket_to_row(t, world) for t in tickets]
 
 
@@ -466,11 +514,16 @@ def world_and_ticket_from_row(row: dict):
     return world, ticket
 
 
-class PolicyComplianceScorer:
-    """Grades one predict() output against the ticket's hidden ground truth.
-    Deterministic and rule-based on purpose - no LLM judge involved, so the
-    before/after numbers this produces are fully auditable. - call .score(...) directly."""
+class PolicyComplianceScorer(weave.Scorer):
+    """weave.Evaluation scorer: grades one predict() output against the
+    ticket's hidden ground truth. Deterministic and rule-based on purpose -
+    no LLM judge involved, so the before/after numbers this produces in Weave
+    are fully auditable. Numeric/boolean fields returned here are averaged
+    automatically by Weave's auto_summarize (means for numbers, counts/
+    fractions for booleans), which is what populates the Evals comparison
+    view in the UI."""
 
+    @weave.op()
     def score(self, output: dict, ticket_id: str, account_id: str, category: str,
               text: str, account_tier: str, account_device_os: str,
               account_seats_remaining: int, history_count_30d: int,
